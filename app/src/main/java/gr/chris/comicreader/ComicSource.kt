@@ -1,0 +1,206 @@
+package gr.chris.comicreader
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.pdf.PdfRenderer
+import android.net.Uri
+import android.os.ParcelFileDescriptor
+import android.util.LruCache
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.InputStream
+import java.util.zip.ZipFile
+
+data class Comic(val name: String, val uri: Uri) {
+    val title: String get() = name.substringBeforeLast('.')
+    val isPdf: Boolean get() = name.lowercase().endsWith(".pdf")
+}
+
+interface ComicSource {
+    val pageCount: Int
+    suspend fun loadPage(index: Int, targetWidth: Int): Bitmap?
+    fun close()
+}
+
+suspend fun openComic(ctx: Context, c: Comic): ComicSource =
+    if (c.isPdf) PdfSource.open(ctx, c.uri) else CbzSource.open(ctx, c.uri)
+
+/** "2.jpg" < "10.jpg" : numbers inside names are compared as numbers. */
+fun naturalCompare(a: String, b: String): Int {
+    var i = 0
+    var j = 0
+    while (i < a.length && j < b.length) {
+        val ca = a[i]
+        val cb = b[j]
+        if (ca.isDigit() && cb.isDigit()) {
+            var si = i
+            while (si < a.length && a[si].isDigit()) si++
+            var sj = j
+            while (sj < b.length && b[sj].isDigit()) sj++
+            val na = a.substring(i, si).trimStart('0')
+            val nb = b.substring(j, sj).trimStart('0')
+            if (na.length != nb.length) return na.length - nb.length
+            val c = na.compareTo(nb)
+            if (c != 0) return c
+            i = si
+            j = sj
+        } else {
+            val c = ca.lowercaseChar().compareTo(cb.lowercaseChar())
+            if (c != 0) return c
+            i++
+            j++
+        }
+    }
+    return (a.length - i) - (b.length - j)
+}
+
+private fun decodeSampled(open: () -> InputStream, targetWidth: Int): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    open().use { BitmapFactory.decodeStream(it, null, bounds) }
+    if (bounds.outWidth <= 0) return null
+    var sample = 1
+    while (bounds.outWidth / (sample * 2) >= targetWidth) sample *= 2
+    val opts = BitmapFactory.Options().apply {
+        inSampleSize = sample
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+    }
+    return open().use { BitmapFactory.decodeStream(it, null, opts) }
+}
+
+class CbzSource private constructor(
+    private val zip: ZipFile,
+    private val names: List<String>
+) : ComicSource {
+    override val pageCount: Int get() = names.size
+
+    override suspend fun loadPage(index: Int, targetWidth: Int): Bitmap? = withContext(Dispatchers.IO) {
+        if (index !in names.indices) return@withContext null
+        val entry = zip.getEntry(names[index]) ?: return@withContext null
+        decodeSampled({ zip.getInputStream(entry) }, targetWidth)
+    }
+
+    override fun close() {
+        try { zip.close() } catch (_: Exception) { }
+    }
+
+    companion object {
+        private val IMG = listOf(".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+
+        suspend fun open(ctx: Context, uri: Uri): CbzSource = withContext(Dispatchers.IO) {
+            val f = File(ctx.cacheDir, "current.cbz")
+            val input = ctx.contentResolver.openInputStream(uri)
+                ?: throw IllegalStateException("Cannot open the file")
+            input.use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+            val zip = try {
+                ZipFile(f)
+            } catch (e: Exception) {
+                throw IllegalStateException("This file is not a valid CBZ/ZIP (CBR/RAR is not supported)")
+            }
+            val names = zip.entries().asSequence()
+                .filter { !it.isDirectory }
+                .map { it.name }
+                .filter { n ->
+                    val l = n.lowercase()
+                    !l.startsWith("__macosx") &&
+                        !n.substringAfterLast('/').startsWith(".") &&
+                        IMG.any { l.endsWith(it) }
+                }
+                .sortedWith { a, b -> naturalCompare(a, b) }
+                .toList()
+            if (names.isEmpty()) {
+                zip.close()
+                throw IllegalStateException("No images found inside this file")
+            }
+            CbzSource(zip, names)
+        }
+    }
+}
+
+class PdfSource private constructor(
+    private val pfd: ParcelFileDescriptor,
+    private val renderer: PdfRenderer
+) : ComicSource {
+    private val lock = Mutex()
+    override val pageCount: Int get() = renderer.pageCount
+
+    override suspend fun loadPage(index: Int, targetWidth: Int): Bitmap? = withContext(Dispatchers.IO) {
+        if (index !in 0 until renderer.pageCount) return@withContext null
+        lock.withLock {
+            val page = renderer.openPage(index)
+            try {
+                val w = targetWidth.coerceIn(400, 2200)
+                val h = (w.toFloat() * page.height / page.width).toInt().coerceAtLeast(1)
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bmp.eraseColor(Color.WHITE)
+                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                bmp
+            } finally {
+                page.close()
+            }
+        }
+    }
+
+    override fun close() {
+        try { renderer.close() } catch (_: Exception) { }
+        try { pfd.close() } catch (_: Exception) { }
+    }
+
+    companion object {
+        suspend fun open(ctx: Context, uri: Uri): PdfSource = withContext(Dispatchers.IO) {
+            try {
+                val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
+                    ?: throw IllegalStateException("Cannot open the file")
+                try {
+                    PdfSource(pfd, PdfRenderer(pfd))
+                } catch (e: Exception) {
+                    pfd.close()
+                    throw e
+                }
+            } catch (e: Exception) {
+                // fallback: copy to the app cache (needed when the provider is not seekable)
+                val f = File(ctx.cacheDir, "current.pdf")
+                val input = ctx.contentResolver.openInputStream(uri)
+                    ?: throw IllegalStateException("Cannot open the file")
+                input.use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                val pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+                try {
+                    PdfSource(pfd, PdfRenderer(pfd))
+                } catch (e2: Exception) {
+                    pfd.close()
+                    throw IllegalStateException("Cannot open this PDF (password-protected or damaged)")
+                }
+            }
+        }
+    }
+}
+
+/** Keeps decoded pages in memory (about 1/5 of the app's heap). */
+class PageCache(private val src: ComicSource, private val width: Int) {
+    private val cache = object : LruCache<Int, Bitmap>((Runtime.getRuntime().maxMemory() / 5).toInt()) {
+        override fun sizeOf(key: Int, value: Bitmap): Int = value.byteCount
+    }
+
+    val pageCount: Int get() = src.pageCount
+
+    fun peek(i: Int): Bitmap? = cache.get(i)
+
+    suspend fun get(i: Int): Bitmap? {
+        if (i < 0 || i >= src.pageCount) return null
+        cache.get(i)?.let { return it }
+        return try {
+            val b = src.loadPage(i, width)
+            if (b != null) cache.put(i, b)
+            b
+        } catch (e: OutOfMemoryError) {
+            cache.evictAll()
+            null
+        } catch (e: Exception) {
+            null
+        }
+    }
+}
