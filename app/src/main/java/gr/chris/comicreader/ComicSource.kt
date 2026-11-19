@@ -1,4 +1,31 @@
-   fun close()
+package gr.chris.comicreader
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.pdf.PdfRenderer
+import android.net.Uri
+import android.os.ParcelFileDescriptor
+import android.util.LruCache
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.InputStream
+import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+
+data class Comic(val name: String, val uri: Uri) {
+    val title: String get() = name.substringBeforeLast('.')
+    val isPdf: Boolean get() = name.lowercase().endsWith(".pdf")
+}
+
+interface ComicSource {
+    val pageCount: Int
+    suspend fun loadPage(index: Int, targetWidth: Int): Bitmap?
+    fun close()
 }
 
 suspend fun openComic(ctx: Context, c: Comic): ComicSource =
