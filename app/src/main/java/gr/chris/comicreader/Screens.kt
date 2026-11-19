@@ -1,6 +1,7 @@
 package gr.chris.comicreader
 
 import android.content.Intent
+import android.graphics.Bitmap
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -8,6 +9,7 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -24,7 +26,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
@@ -40,6 +41,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -47,7 +49,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -159,6 +163,50 @@ private fun scan(dir: DocumentFile, depth: Int, out: MutableList<Comic>) {
 }
 
 @Composable
+fun ComicThumbnail(comic: Comic, modifier: Modifier = Modifier) {
+    val ctx = LocalContext.current
+    val key = comic.uri.toString()
+    val bmp: Bitmap? by produceState<Bitmap?>(initialValue = ThumbnailCache.get(key), key) {
+        val cached = ThumbnailCache.get(key)
+        if (cached != null) {
+            value = cached
+        } else {
+            value = null
+            val loaded = loadThumbnail(ctx, comic, targetWidth = 160)
+            if (loaded != null) {
+                ThumbnailCache.put(key, loaded)
+                value = loaded
+            }
+        }
+    }
+    Box(
+        modifier
+            .size(56.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (comic.isPdf) Color(0xFFEC4899) else Color(0xFF7C3AED)),
+        contentAlignment = Alignment.Center
+    ) {
+        val b = bmp
+        if (b != null) {
+            Image(
+                bitmap = b.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            // Placeholder while loading / on failure
+            Text(
+                comic.title.take(1).uppercase(),
+                color = Color.White,
+                fontSize = 22.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+@Composable
 fun LibraryScreen(prefs: Prefs, onOpen: (Comic) -> Unit, onSetup: () -> Unit) {
     val ctx = LocalContext.current
     var comics by remember { mutableStateOf<List<Comic>?>(null) }
@@ -180,7 +228,10 @@ fun LibraryScreen(prefs: Prefs, onOpen: (Comic) -> Unit, onSetup: () -> Unit) {
     }
 
     Column(Modifier.fillMaxSize().background(BgColor).statusBarsPadding().navigationBarsPadding()) {
-        Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 12.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 12.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Column(Modifier.weight(1f)) {
                 Text("Library", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold)
                 Text("Hi ${prefs.name}", color = Color.White.copy(alpha = 0.6f), fontSize = 14.sp)
@@ -190,16 +241,18 @@ fun LibraryScreen(prefs: Prefs, onOpen: (Comic) -> Unit, onSetup: () -> Unit) {
                     Icon(Icons.Default.MoreVert, contentDescription = "Menu", tint = Color.White)
                 }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    DropdownMenuItem(text = { Text("Refresh") }, onClick = { menu = false; refresh++ })
                     DropdownMenuItem(
-                        text = { Text(if (flip) "Page turn: flip animation" else "Page turn: no animation") },
+                        text = { Text(if (flip) "Flip animation: ON" else "Flip animation: OFF") },
                         onClick = { flip = !flip; prefs.flip = flip; menu = false }
                     )
                     DropdownMenuItem(
                         text = { Text(if (lock) "Lock: ON" else "Lock: OFF") },
                         onClick = { lock = !lock; prefs.lock = lock; menu = false }
                     )
-                    DropdownMenuItem(text = { Text("Change name / folder") }, onClick = { menu = false; onSetup() })
+                    DropdownMenuItem(
+                        text = { Text("Change name / folder") },
+                        onClick = { menu = false; onSetup() }
+                    )
                 }
             }
         }
@@ -220,21 +273,24 @@ fun LibraryScreen(prefs: Prefs, onOpen: (Comic) -> Unit, onSetup: () -> Unit) {
                 items(list, key = { it.uri.toString() }) { c ->
                     val pos = prefs.getPos(c.uri.toString())
                     Row(
-                        Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
                             .clip(RoundedCornerShape(14.dp))
                             .background(SurfaceColor)
                             .clickable { onOpen(c) }
-                            .padding(12.dp),
+                            .padding(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Box(
-                            Modifier.size(46.dp).clip(CircleShape).background(if (c.isPdf) Color(0xFFEC4899) else Color(0xFF7C3AED)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(c.title.take(1).uppercase(), color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                        }
-                        Column(Modifier.padding(start = 14.dp)) {
-                            Text(c.title, color = Color.White, fontSize = 16.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        ComicThumbnail(c)
+                        Column(Modifier.padding(start = 14.dp).weight(1f)) {
+                            Text(
+                                c.title,
+                                color = Color.White,
+                                fontSize = 16.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
                             Text(
                                 (if (c.isPdf) "PDF" else "CBZ") + if (pos > 0) "  \u00B7  page ${pos + 1}" else "",
                                 color = Color.White.copy(alpha = 0.55f),
