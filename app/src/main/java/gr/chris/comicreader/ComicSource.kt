@@ -1,30 +1,4 @@
-package gr.chris.comicreader
-
-import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Color
-import android.graphics.pdf.PdfRenderer
-import android.net.Uri
-import android.os.ParcelFileDescriptor
-import android.util.LruCache
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.InputStream
-import java.util.zip.ZipFile
-
-data class Comic(val name: String, val uri: Uri) {
-    val title: String get() = name.substringBeforeLast('.')
-    val isPdf: Boolean get() = name.lowercase().endsWith(".pdf")
-}
-
-interface ComicSource {
-    val pageCount: Int
-    suspend fun loadPage(index: Int, targetWidth: Int): Bitmap?
-    fun close()
+   fun close()
 }
 
 suspend fun openComic(ctx: Context, c: Comic): ComicSource =
@@ -72,6 +46,83 @@ private fun decodeSampled(open: () -> InputStream, targetWidth: Int): Bitmap? {
     return open().use { BitmapFactory.decodeStream(it, null, opts) }
 }
 
+private val IMG_EXT = listOf(".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+
+/**
+ * Lightweight thumbnail of the first page (cover).
+ * Does NOT copy the whole CBZ to cache — streams the first image only.
+ * Size is small (~120–200 px) so the library list stays smooth.
+ */
+suspend fun loadThumbnail(ctx: Context, comic: Comic, targetWidth: Int = 160): Bitmap? =
+    withContext(Dispatchers.IO) {
+        try {
+            if (comic.isPdf) loadPdfThumbnail(ctx, comic.uri, targetWidth)
+            else loadCbzThumbnail(ctx, comic.uri, targetWidth)
+        } catch (_: Exception) {
+            null
+        } catch (_: OutOfMemoryError) {
+            null
+        }
+    }
+
+private fun loadPdfThumbnail(ctx: Context, uri: Uri, targetWidth: Int): Bitmap? {
+    val pfd = ctx.contentResolver.openFileDescriptor(uri, "r") ?: return null
+    return try {
+        val renderer = PdfRenderer(pfd)
+        try {
+            if (renderer.pageCount <= 0) return null
+            val page = renderer.openPage(0)
+            try {
+                val w = targetWidth.coerceIn(80, 400)
+                val h = (w.toFloat() * page.height / page.width).toInt().coerceAtLeast(1)
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bmp.eraseColor(Color.WHITE)
+                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                bmp
+            } finally {
+                page.close()
+            }
+        } finally {
+            renderer.close()
+        }
+    } finally {
+        try { pfd.close() } catch (_: Exception) { }
+    }
+}
+
+/** Stream the first image entry from a CBZ/ZIP without copying the whole archive. */
+private fun loadCbzThumbnail(ctx: Context, uri: Uri, targetWidth: Int): Bitmap? {
+    val input = ctx.contentResolver.openInputStream(uri) ?: return null
+    return input.use { stream ->
+        ZipInputStream(stream).use { zis ->
+            var entry = zis.nextEntry
+            val candidates = mutableListOf<Pair<String, ByteArray>>()
+            // Collect a few early image entries (we can't seek, so we pick the
+            // lexicographically first name after natural sort among the first ones we see).
+            // For most CBZs the first entry is already the cover.
+            while (entry != null && candidates.size < 40) {
+                val name = entry.name
+                val l = name.lowercase()
+                if (!entry.isDirectory &&
+                    !l.startsWith("__macosx") &&
+                    !name.substringAfterLast('/').startsWith(".") &&
+                    IMG_EXT.any { l.endsWith(it) }
+                ) {
+                    // Read only a reasonable amount for a thumbnail (max ~4 MB)
+                    val bytes = zis.readBytes().takeIf { it.size in 1..(4 * 1024 * 1024) }
+                    if (bytes != null) candidates.add(name to bytes)
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+            if (candidates.isEmpty()) return null
+            // Prefer the naturally first name (same order as the reader)
+            val best = candidates.minWithOrNull { a, b -> naturalCompare(a.first, b.first) } ?: return null
+            decodeSampled({ best.second.inputStream() }, targetWidth)
+        }
+    }
+}
+
 class CbzSource private constructor(
     private val zip: ZipFile,
     private val names: List<String>
@@ -89,8 +140,6 @@ class CbzSource private constructor(
     }
 
     companion object {
-        private val IMG = listOf(".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
-
         suspend fun open(ctx: Context, uri: Uri): CbzSource = withContext(Dispatchers.IO) {
             val f = File(ctx.cacheDir, "current.cbz")
             val input = ctx.contentResolver.openInputStream(uri)
@@ -108,7 +157,7 @@ class CbzSource private constructor(
                     val l = n.lowercase()
                     !l.startsWith("__macosx") &&
                         !n.substringAfterLast('/').startsWith(".") &&
-                        IMG.any { l.endsWith(it) }
+                        IMG_EXT.any { l.endsWith(it) }
                 }
                 .sortedWith { a, b -> naturalCompare(a, b) }
                 .toList()
@@ -202,5 +251,20 @@ class PageCache(private val src: ComicSource, private val width: Int) {
         } catch (e: Exception) {
             null
         }
+    }
+}
+
+/** In-memory cache for library thumbnails (shared across recompositions). */
+object ThumbnailCache {
+    private val cache = object : LruCache<String, Bitmap>(
+        (Runtime.getRuntime().maxMemory() / 16).toInt().coerceAtLeast(4 * 1024 * 1024)
+    ) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
+    fun get(key: String): Bitmap? = cache.get(key)
+
+    fun put(key: String, bmp: Bitmap) {
+        cache.put(key, bmp)
     }
 }
